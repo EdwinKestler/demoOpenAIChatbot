@@ -55,7 +55,7 @@ def get_db():
 
 @app.post("/message")
 async def reply(Body: str = Form(), db: Session = Depends(get_db)):
-    # Call the OpenAI API to generate text with GPT-3.5
+    # Call the OpenAI API to generate text with GPT-4
     if "precio" in Body.lower() and "martillo" in Body.lower():
         chat_response = "El precio del martillo es de $3 dólares y hay 4 unidades disponibles."
     elif "cotización" in Body.lower():
