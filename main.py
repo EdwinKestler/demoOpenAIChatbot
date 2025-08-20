@@ -1,6 +1,7 @@
 # Third-party imports
 import openai
 import os
+import time
 from fastapi import FastAPI, Form, Depends
 from fastapi.responses import FileResponse
 from decouple import config
@@ -64,15 +65,33 @@ async def reply(Body: str = Form(), db: Session = Depends(get_db)):
         print(pdf_file_path)
         return FileResponse(pdf_file_path, media_type="application/pdf", filename="/cotizacion.pdf")
     else:
-        completion = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Eres un asistente virtual de la ferreteria Freund identifica si te piden herramienta y cuale son los precios"},
-                {"role": "user", "content": Body}
-            ],
-            max_tokens=1000,
-        )
-        chat_response = completion.choices[0].message['content']
+        chat_response = ""
+        for attempt in range(3):
+            try:
+                completion = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Eres un asistente virtual de la ferreteria Freund identifica si te piden herramienta y cuales son los precios"
+                            ),
+                        },
+                        {"role": "user", "content": Body},
+                    ],
+                    max_tokens=1000,
+                    timeout=15,
+                )
+                chat_response = completion.choices[0].message['content']
+                break
+            except openai.error.OpenAIError as e:
+                logger.error(
+                    f"OpenAI API call failed on attempt {attempt + 1} for input '{Body}': {e}"
+                )
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        else:
+            chat_response = "Lo siento, no puedo responder en este momento."
 
 
     # Store the conversation in the database
