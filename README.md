@@ -34,6 +34,18 @@ DB_PASSWORD="postgres-password"
 python -m pip install -r requirements.txt
 ```
 
+## Credential tests
+Scripts in `test/` verify that required credentials are configured.
+Run them individually:
+```bash
+python test/postgres_cred_conn_test.py
+python test/openai_credentials_connection_test.py
+python test/twilio_snadbox_conn_test.py
+```
+Each script loads credentials from `.env` and expects the following variables:
+DB_USER, DB_PASSWORD, OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER, TO_NUMBER.
+
+
 ## Running the server
 1. Start the FastAPI development server:
    ```bash
