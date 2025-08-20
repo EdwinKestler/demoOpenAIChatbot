@@ -1,0 +1,61 @@
+<!-- Filename: app/templates/conversations.html
+     Approx new file
+     Reason: Browse/search conversations with pagination. -->
+{% extends "base.html" %}
+{% block content %}
+  <h1>Conversations</h1>
+
+  <form method="get" action="/conversations" class="searchbar">
+    <input
+      type="text"
+      name="q"
+      value="{{ q }}"
+      placeholder="Search sender, message, response..." />
+    <input type="number" name="per_page" value="{{ per_page }}" min="1" max="200" />
+    <button type="submit">Search</button>
+    {% if q %}
+      <a class="clear" href="/conversations">Clear</a>
+    {% endif %}
+  </form>
+
+  <div class="meta">
+    <span>Total: {{ total }}</span>
+    <span>Page {{ page }} / {{ total_pages }}</span>
+  </div>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th style="width: 70px;">ID</th>
+        <th style="width: 220px;">Sender</th>
+        <th>Message</th>
+        <th>Response</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in items %}
+      <tr>
+        <td class="mono">{{ c.id }}</td>
+        <td class="mono">{{ c.sender }}</td>
+        <td><pre>{{ c.message }}</pre></td>
+        <td><pre>{{ c.response }}</pre></td>
+      </tr>
+      {% endfor %}
+      {% if items|length == 0 %}
+      <tr><td colspan="4" class="empty">No conversations found.</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  <div class="pager">
+    {% set qparam = "&q=" ~ q if q else "" %}
+    {% set pparam = "&per_page=" ~ per_page %}
+    <a class="btn {% if page <= 1 %}disabled{% endif %}"
+       href="/conversations?page={{ page-1 }}{{ pparam }}{{ qparam }}">← Prev</a>
+
+    <span class="pages">Page {{ page }} / {{ total_pages }}</span>
+
+    <a class="btn {% if page >= total_pages %}disabled{% endif %}"
+       href="/conversations?page={{ page+1 }}{{ pparam }}{{ qparam }}">Next →</a>
+  </div>
+{% endblock %}
