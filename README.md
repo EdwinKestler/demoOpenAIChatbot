@@ -10,6 +10,13 @@ This project is a WhatsApp chatbot powered by [OpenAI's GPT‑4](https://openai.
 - **PostgreSQL** stores each conversation for later analysis or auditing.
 - **PDF Service** demonstrates generating a PDF quote when the user requests a "cotización".
 
+## Prerequisites
+- Python 3.10+ and pip
+- An OpenAI account with an API key
+- A Twilio account with WhatsApp sandbox enabled
+- A running PostgreSQL database (default connection is `localhost:5432` and database `mydb`)
+- [ngrok](https://ngrok.com/) or a similar tunnelling tool to expose the local server
+
 ## Setup
 ### Environment variables
 Create a `.env` file or export the following variables before running the app:
@@ -34,6 +41,27 @@ DB_PASSWORD="postgres-password"
 python -m pip install -r requirements.txt
 ```
 
+### Run locally
+1. Clone the repository and change into its directory:
+   ```bash
+   git clone https://github.com/your-org/demoOpenAIChatbot.git
+   cd demoOpenAIChatbot
+   ```
+2. (Optional) Create and activate a virtual environment:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   ```
+3. Start the FastAPI development server:
+   ```bash
+   uvicorn app.main:app --reload
+   ```
+4. Expose the server to the internet using a tunnelling service such as ngrok:
+   ```bash
+   ngrok http 8000
+   ```
+5. In the [Twilio WhatsApp sandbox](https://www.twilio.com/console/sms/whatsapp/sandbox), set the **WHEN A MESSAGE COMES IN** URL to the publicly accessible URL followed by `/message` (e.g. `https://<ngrok-id>.ngrok.io/message`).
+
 ## Credential tests
 Scripts in `test/` verify that required credentials are configured.
 Run them individually:
@@ -45,17 +73,6 @@ python test/twilio_snadbox_conn_test.py
 Each script loads credentials from `.env` and expects the following variables:
 DB_USER, DB_PASSWORD, OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER, TO_NUMBER.
 
-
-## Running the server
-1. Start the FastAPI development server:
-   ```bash
-   uvicorn app.main:app --reload
-   ```
-2. Expose the server to the internet using a tunnelling service such as ngrok:
-   ```bash
-   ngrok http 8000
-   ```
-3. In the [Twilio WhatsApp sandbox](https://www.twilio.com/console/sms/whatsapp/sandbox), set the **WHEN A MESSAGE COMES IN** URL to the publicly accessible URL followed by `/message` (e.g. `https://<ngrok-id>.ngrok.io/message`).
 
 ## Project structure
 After refactoring, the project is organised as:
