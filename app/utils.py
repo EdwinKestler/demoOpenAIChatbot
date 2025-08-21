@@ -1,12 +1,17 @@
 # Filename: app/utils.py
-# Approx lines modified: ~1-120
-# Reason: STOP using content_sid by default; send free-form text with body=. Optional template fallback.
-#         Add use_template flag, optional media_url support, and WA prefix helper.
+# Approx lines modified: ~1-180
+# Reason:
+#  - ADD helper to download Twilio media (requires HTTP Basic Auth) and save into ./public
+#  - RETURN the local path, filename and public URL so we can pass it to OpenAI Vision and WA
+#  - Reuse existing Twilio/env config; read PUBLIC_BASE_URL for public link composition.
 
 import logging
 import time
-import json  # [ADDED] for content_variables
-from typing import Optional, List  # [ADDED]
+import json
+import os                 # [ADDED]
+import uuid               # [ADDED]
+import requests           # [ADDED] to fetch Twilio media with basic auth
+from typing import Optional, List
 
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
@@ -15,10 +20,10 @@ from decouple import config
 # Twilio credentials from environment
 account_sid = config("TWILIO_ACCOUNT_SID")
 auth_token = config("TWILIO_AUTH_TOKEN")
-twilio_from = config("TWILIO_NUMBER")  # e.g., "whatsapp:+14155238886"
-# Optional defaults (you can leave unset)
-DEFAULT_CONTENT_SID = config("TWILIO_CONTENT_SID", default="")  # [ADDED] HX... if you want fallback
-TWILIO_USE_TEMPLATE = config("TWILIO_USE_TEMPLATE", cast=bool, default=False)  # [ADDED]
+twilio_from = config("TWILIO_NUMBER")
+DEFAULT_CONTENT_SID = config("TWILIO_CONTENT_SID", default="")
+TWILIO_USE_TEMPLATE = config("TWILIO_USE_TEMPLATE", cast=bool, default=False)
+PUBLIC_BASE_URL = config("PUBLIC_BASE_URL", default="")  # [ADDED] used to build public file URL
 
 client = Client(account_sid, auth_token)
 
@@ -26,17 +31,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def _wa(n: str) -> str:
-    """Ensure the whatsapp: prefix is present."""  # [ADDED]
+    """Ensure the whatsapp: prefix is present."""
     return n if n.startswith("whatsapp:") else f"whatsapp:{n}"
 
 def send_message(
     to_number: str,
     body_text: Optional[str] = None,
     *,
-    media_urls: Optional[List[str]] = None,     # [ADDED] send PDFs/images via URL
-    use_template: Optional[bool] = None,        # [ADDED] override per call; default uses env flag
-    template_sid: Optional[str] = None,         # [ADDED] HX... (Twilio Content SID)
-    template_vars: Optional[dict] = None,       # [ADDED] {"1": "value", ...}
+    media_urls: Optional[List[str]] = None,
+    use_template: Optional[bool] = None,
+    template_sid: Optional[str] = None,
+    template_vars: Optional[dict] = None,
     max_retries: int = 3,
 ):
     """
@@ -96,3 +101,27 @@ def send_message(
                 time.sleep(2 ** (attempt - 1))
             else:
                 raise
+            
+# ---------------- NEW HELPER: Download WA image to public ---------------- #
+def download_twilio_media_to_public(media_url: str, out_dir: str = "public") -> tuple[str, str, Optional[str]]:
+    """
+    Download a Twilio-hosted media (requires basic auth) and save under ./public
+    Returns: (file_path, filename, public_url or None)
+    - file_path: local absolute/relative path saved
+    - filename: basename saved under out_dir
+    - public_url: PUBLIC_BASE_URL + /public/filename if base is configured, else None
+    """
+    os.makedirs(out_dir, exist_ok=True)  #comments: ensure folder exists
+    # Twilio media URLs often lack filename, so we generate one with uuid and keep jpg extension by default.
+    fname = f"{uuid.uuid4().hex}.jpg"  # #comments: you may detect content-type to pick extension
+    fpath = os.path.join(out_dir, fname)
+
+    # #comments: Twilio requires HTTP Basic Auth (Account SID, Auth Token)
+    resp = requests.get(media_url, auth=(account_sid, auth_token), timeout=20)
+    resp.raise_for_status()
+    with open(fpath, "wb") as f:
+        f.write(resp.content)
+
+    public_url = f"{PUBLIC_BASE_URL}/public/{fname}" if PUBLIC_BASE_URL else None
+    logger.info(f"Saved media to {fpath} public_url={public_url}")
+    return fpath, fname, public_url
