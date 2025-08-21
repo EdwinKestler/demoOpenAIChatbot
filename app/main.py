@@ -24,6 +24,7 @@ from app.utils import send_message, logger
 from app.utils import download_twilio_media_to_public       # [ADDED] to fetch Twilio images
 from app.services.pdf import generate_pdf
 from app.llm_logic import llm_sales_reply, llm_classify_image  # [ADDED] vision classify
+from app.database import (ChatSessionLocal, CatalogSessionLocal, ChatBase, CatalogBase, chat_engine, catalog_engine)
 
 app = FastAPI()
 
@@ -52,8 +53,15 @@ _HARDWARE_ANCHORS = [
 
 TRIM_LEN = 3000
 
-def get_db():
-    db = SessionLocal()
+def get_chat_db():
+    db = ChatSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_catalog_db():
+    db = CatalogSessionLocal()
     try:
         yield db
     finally:
@@ -62,8 +70,11 @@ def get_db():
 @app.on_event("startup")
 def on_startup():
     try:
-        Base.metadata.create_all(bind=engine)  # #comments: creates Product table if missing
-        logger.info("Database tables ensured on startup.")
+        # Create tables for chat DB (conversations)
+        ChatBase.metadata.create_all(bind=chat_engine)
+        # Create tables for catalog DB (products)
+        CatalogBase.metadata.create_all(bind=catalog_engine)
+        logger.info("Database tables ensured on startup for both DBs.")
     except Exception as e:
         logger.error(f"DB init failed at startup: {e}")
 
@@ -82,7 +93,8 @@ async def reply(
     NumMedia: str = Form("0"),                      # [ADDED] Twilio media count
     MediaUrl0: Optional[str] = Form(None),          # [ADDED] First media URL
     MediaContentType0: Optional[str] = Form(None),  # [ADDED] First media content type (e.g., image/jpeg)
-    db: Session = Depends(get_db),
+    db_chat: Session = Depends(get_chat_db),        # [ADDED] For conversations
+    db_catalog: Session = Depends(get_catalog_db),  # [ADDED] For products
 ):
     """
     New behavior for images:
@@ -122,7 +134,7 @@ async def reply(
 
         # 1.c If we recognize an anchor we sell → fetch from DB and reply attaching product image
         if anchor in _HARDWARE_ANCHORS:
-            product = db.query(Product).filter(Product.anchor == anchor).first()
+            product = db_catalog.query(Product).filter(Product.anchor == anchor).first()  # [CHANGED] Use db_catalog
             if product:
                 price_usd = product.price_cents / 100.0
                 # #comments: Build a short, sales-friendly reply
@@ -131,7 +143,7 @@ async def reply(
                     f"Tenemos {product.name}: ${price_usd:.2f}, stock {product.stock}."
                 )
                 media_list = [product.image_url] if product.image_url else None
-                _send_and_store(db, From_, Body, reply_text, media_urls=media_list)
+                _send_and_store(db_chat, From_, Body, reply_text, media_urls=media_list)  # [CHANGED] Pass db_chat
                 return JSONResponse({"ok": True})
             else:
                 # #comments: Anchor recognized but not in DB
@@ -139,7 +151,7 @@ async def reply(
                     f"Identifiqué {description} ({anchor}). "
                     "Aún no lo tengo cargado en inventario. ¿Deseas una cotización?"
                 )
-                _send_and_store(db, From_, Body, reply_text)
+                _send_and_store(db_chat, From_, Body, reply_text)  # [CHANGED] Pass db_chat
                 return JSONResponse({"ok": True})
         else:
             # #comments: Not a hardware item from our catalog
@@ -147,20 +159,20 @@ async def reply(
                 "Gracias por la imagen. No identifiqué un producto de ferretería de nuestro catálogo. "
                 + HARDWARE_MENU
             )
-            _send_and_store(db, From_, Body, reply_text)
+            _send_and_store(db_chat, From_, Body, reply_text)  # [CHANGED] Pass db_chat
             return JSONResponse({"ok": True})
 
     # (2) SIMPLE KEYWORDS WITHOUT LLM (example)
     if "precio" in lower and "martillo" in lower:
         # #comments: demo fallback when no image present
-        p = db.query(Product).filter(Product.anchor == "martillo").first()
+        p = db_catalog.query(Product).filter(Product.anchor == "martillo").first()  # [CHANGED] Use db_catalog
         if p:
             price_usd = p.price_cents / 100.0
             msg = f"El {p.name} cuesta ${price_usd:.2f} y hay {p.stock} en stock."
             media_list = [p.image_url] if p.image_url else None
-            _send_and_store(db, From_, Body, msg, media_urls=media_list)
+            _send_and_store(db_chat, From_, Body, msg, media_urls=media_list)  # [CHANGED] Pass db_chat
         else:
-            _send_and_store(db, From_, Body, "Martillo disponible. ¿Deseas una cotización?")
+            _send_and_store(db_chat, From_, Body, "Martillo disponible. ¿Deseas una cotización?")  # [CHANGED] Pass db_chat
         return JSONResponse({"ok": True})
 
     # (3) COTIZACIÓN FLOW (unchanged demo)
@@ -169,23 +181,23 @@ async def reply(
         _, pdf_name = generate_pdf(content, out_dir="public")
         media_url = f"{PUBLIC_BASE_URL}/public/{pdf_name}" if PUBLIC_BASE_URL else None
         msg = "Te envío la cotización en PDF adjunta." if media_url else "Generé la cotización (revisa /public)."
-        _send_and_store(db, From_, Body, msg, media_urls=[media_url] if media_url else None)
+        _send_and_store(db_chat, From_, Body, msg, media_urls=[media_url] if media_url else None)  # [CHANGED] Pass db_chat
         return JSONResponse({"ok": True})
 
     # (4) OTHERWISE → one LLM text turn
     chat_response = llm_sales_reply(text) or REPLY_DONT_KNOW
-    _send_and_store(db, From_, Body, chat_response)
+    _send_and_store(db_chat, From_, Body, chat_response)  # [CHANGED] Pass db_chat
     return JSONResponse({"ok": True})
 
 # ----------------- Helpers ----------------- #
-def _send_and_store(db: Session, to_number: str, user_msg: str, reply_text: str, *, media_urls=None) -> None:
+def _send_and_store(db: Session, to_number: str, user_msg: str, reply_text: str, *, media_urls=None) -> None:  # [CHANGED] db is now passed (always db_chat)
     try:
         send_message(to_number, reply_text, media_urls=media_urls)
     except Exception as e:
         logger.error(f"Failed to send WA message: {e}")
     _store(db, to_number, user_msg, reply_text)
 
-def _store(db: Session, sender: str, message: str, response: str):
+def _store(db: Session, sender: str, message: str, response: str):  # [CHANGED] db is passed
     try:
         conversation = Conversation(sender=sender, message=message, response=response)
         db.add(conversation)

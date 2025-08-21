@@ -1,13 +1,9 @@
 # Filename: app/models.py
-# Approx lines modified: ~1-80
-# Reason:
-#  - ADD Product model to store catalog info (anchor → name, price, stock, product image URL)
-#  - Keep Conversation unchanged
+# Approx lines modified: ~1-20 (imports), ~30-50 (Conversation model), ~60-80 (Product model)
+from sqlalchemy import Column, Integer, String, Index
+from app.database import ChatBase, CatalogBase  # [CHANGED] Import separate Bases
 
-from sqlalchemy import Column, Integer, String, Index  # [ADDED Index for fast anchor lookup]
-from app.database import Base
-
-class Conversation(Base):
+class Conversation(ChatBase):  # [CHANGED] Use ChatBase for postgres DB
     __tablename__ = "conversations"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -19,26 +15,18 @@ class Conversation(Base):
         return f"<Conversation id={self.id} sender={self.sender!r}>"
 
 # ------------------ NEW MODEL ------------------ #
-class Product(Base):  # [ADDED ~35]
+class Product(CatalogBase):  # [CHANGED] Use CatalogBase for my_catalog_db
     """
-    Store items we can sell over WhatsApp.
-    - anchor: normalized keyword from HARDWARE_ANCHORS (e.g., 'martillo')
-    - name: human-friendly product name
-    - price_cents: integer cents to avoid float errors
-    - stock: integer available units
-    - image_url: public URL to product picture (we will attach this in WA)
+    ... (rest unchanged)
     """
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True)
-    anchor = Column(String, index=True, nullable=False)        # e.g., "martillo"
-    name = Column(String, nullable=False)                      # e.g., "Martillo de uña 16oz"
-    price_cents = Column(Integer, nullable=False, default=0)   # store cents
-    stock = Column(Integer, nullable=False, default=0)         # available units
-    image_url = Column(String, nullable=True)                  # public URL for WA media
+    anchor = Column(String, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    price_cents = Column(Integer, nullable=False, default=0)
+    stock = Column(Integer, nullable=False, default=0)
+    image_url = Column(String, nullable=True)
 
-    def __repr__(self) -> str:  # [ADDED]
+    def __repr__(self) -> str:
         return f"<Product id={self.id} anchor={self.anchor!r} name={self.name!r}>"
-
-# (Optional) For heavier catalogs you'd add uniqueness constraints, SKUs, etc.
-# Index on anchor already created via index=True above.
