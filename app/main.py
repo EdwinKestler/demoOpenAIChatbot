@@ -163,11 +163,11 @@ async def reply(
     Body: str = Form(...),
     From_: str = Form(..., alias="From"),
     To: str = Form(..., alias="To"),
-    NumMedia: str = Form("0"),                      # [ADDED] Twilio media count
-    MediaUrl0: Optional[str] = Form(None),          # [ADDED] First media URL
-    MediaContentType0: Optional[str] = Form(None),  # [ADDED] First media content type (e.g., image/jpeg)
-    db_chat: Session = Depends(get_chat_db),        # [ADDED] For conversations
-    db_catalog: Session = Depends(get_catalog_db),  # [ADDED] For products
+    NumMedia: str = Form("0"),
+    MediaUrl0: Optional[str] = Form(None),
+    MediaContentType0: Optional[str] = Form(None),
+    db_chat: Session = Depends(get_chat_db),
+    db_catalog: Session = Depends(get_catalog_db),
 ):
     """
     New behavior for images:
@@ -185,7 +185,6 @@ async def reply(
 
     # (1) IMAGE HANDLING BRANCH
     if n_media > 0 and MediaContentType0 and MediaContentType0.startswith("image/"):
-        # 1.a Download from Twilio to ./public for an accessible URL
         try:
             local_path, filename, public_url = download_twilio_media_to_public(MediaUrl0, out_dir="public")
         except Exception as e:
@@ -194,13 +193,12 @@ async def reply(
             _send_and_store(db_chat, From_, Body, msg)
             return JSONResponse({"ok": True})
 
-        if not public_url:
-            msg = "Recibí tu imagen. Para analizarla, necesito PUBLIC_BASE_URL configurado."
-            _send_and_store(db_chat, From_, Body, msg)
-            return JSONResponse({"ok": True})
+        # [CHANGED START] Prefer LOCAL PATH → data URL (no external fetch)             #comments (~200)
+        image_ref_for_llm = local_path if local_path else (public_url or "")
+        # [CHANGED END]
 
-        # 1.b Classify with OpenAI Vision → JSON {anchor, description, confidence}
-        result = llm_classify_image(public_url)
+        # Classify (GPT‑5‑nano Responses, minimal reasoning, low verbosity)
+        result = llm_classify_image(image_ref_for_llm, max_retries=3, force_detail="low")  #comments
         anchor = (result.get("anchor") or "").strip().lower()
         description = result.get("description") or ""
         confidence = float(result.get("confidence") or 0.0)
