@@ -4,10 +4,11 @@
 #  - Handle incoming images: download from Twilio, re-host under /public, classify with OpenAI Vision
 #  - If anchor ∈ HARDWARE_ANCHORS → fetch Product from Postgres and reply with product photo
 #  - Example path for martillo test included
+#  - [ADDED] Implement /conversations and /api/conversations routes using chat DB for UI/API
 
 import time
 import re
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, Form, Depends, Request, Query
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -18,12 +19,11 @@ from sqlalchemy import or_, func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.models import Conversation, Product                # [CHANGED] import Product
-from app.database import SessionLocal, Base, engine
+from app.models import Conversation, Product
 from app.utils import send_message, logger
-from app.utils import download_twilio_media_to_public       # [ADDED] to fetch Twilio images
+from app.utils import download_twilio_media_to_public
 from app.services.pdf import generate_pdf
-from app.llm_logic import llm_sales_reply, llm_classify_image  # [ADDED] vision classify
+from app.llm_logic import llm_sales_reply, llm_classify_image
 from app.database import (ChatSessionLocal, CatalogSessionLocal, ChatBase, CatalogBase, chat_engine, catalog_engine)
 
 app = FastAPI()
@@ -82,7 +82,80 @@ def on_startup():
 def root():
     return RedirectResponse(url="/conversations")
 
-# ... (conversations UI unchanged) ...
+# -------------------- Conversations UI -------------------- #
+@app.get("/conversations")
+async def list_conversations(
+    request: Request,
+    q: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=200),
+    db: Session = Depends(get_chat_db),
+):
+    """
+    Browse/search conversations with pagination (renders HTML template).
+    Uses chat DB for Conversation queries.
+    """
+    query = db.query(Conversation)
+    if q:
+        q_lower = f"%{q.lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(Conversation.sender).like(q_lower),
+                func.lower(Conversation.message).like(q_lower),
+                func.lower(Conversation.response).like(q_lower),
+            )
+        )
+    total = query.count()
+    items = query.order_by(Conversation.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    total_pages = (total + per_page - 1) // per_page if per_page > 0 else 1
+    return templates.TemplateResponse(
+        "conversations.html",
+        {
+            "request": request,
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "q": q or "",
+        },
+    )
+
+# -------------------- Conversations API -------------------- #
+@app.get("/api/conversations")
+async def api_list_conversations(
+    q: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=200),
+    db: Session = Depends(get_chat_db),
+):
+    """
+    JSON API for listing conversations with search/pagination.
+    Uses chat DB for Conversation queries.
+    """
+    query = db.query(Conversation)
+    if q:
+        q_lower = f"%{q.lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(Conversation.sender).like(q_lower),
+                func.lower(Conversation.message).like(q_lower),
+                func.lower(Conversation.response).like(q_lower),
+            )
+        )
+    total = query.count()
+    items = query.order_by(Conversation.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    total_pages = (total + per_page - 1) // per_page if per_page > 0 else 1
+    return {
+        "items": [
+            {"id": c.id, "sender": c.sender, "message": c.message, "response": c.response} for c in items
+        ],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "q": q or "",
+    }
 
 # -------------------- WhatsApp webhook -------------------- #
 @app.post("/message")
@@ -118,12 +191,12 @@ async def reply(
         except Exception as e:
             logger.error(f"Failed downloading media: {e}")
             msg = "Recibí tu imagen, pero tuve un problema al procesarla. ¿Puedes describir el producto?"
-            _send_and_store(db, From_, Body, msg)
+            _send_and_store(db_chat, From_, Body, msg)
             return JSONResponse({"ok": True})
 
         if not public_url:
             msg = "Recibí tu imagen. Para analizarla, necesito PUBLIC_BASE_URL configurado."
-            _send_and_store(db, From_, Body, msg)
+            _send_and_store(db_chat, From_, Body, msg)
             return JSONResponse({"ok": True})
 
         # 1.b Classify with OpenAI Vision → JSON {anchor, description, confidence}
@@ -212,4 +285,4 @@ def _safe_int(s: str, default: int = 0) -> int:
         return int(s)
     except Exception:
         return default
-
+    
