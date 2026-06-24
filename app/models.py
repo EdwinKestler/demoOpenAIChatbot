@@ -1,9 +1,9 @@
-# Filename: app/models.py
-# Approx lines modified: ~1-20 (imports), ~30-50 (Conversation model), ~60-80 (Product model)
-from sqlalchemy import Column, Integer, String, Index
-from app.database import ChatBase, CatalogBase  # [CHANGED] Import separate Bases
+from sqlalchemy import Column, Integer, String
 
-class Conversation(ChatBase):  # [CHANGED] Use ChatBase for postgres DB
+from app.database import CatalogBase, ChatBase
+
+
+class Conversation(ChatBase):
     __tablename__ = "conversations"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -14,11 +14,8 @@ class Conversation(ChatBase):  # [CHANGED] Use ChatBase for postgres DB
     def __repr__(self) -> str:
         return f"<Conversation id={self.id} sender={self.sender!r}>"
 
-# ------------------ NEW MODEL ------------------ #
-class Product(CatalogBase):  # [CHANGED] Use CatalogBase for my_catalog_db
-    """
-    ... (rest unchanged)
-    """
+
+class Product(CatalogBase):
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True)

@@ -4,4 +4,6 @@ __pycache__/
 *.py[cod]
 cotizacion.pdf
 oauth.yml
-
+public/*
+!public/.gitkeep
+.pytest_cache/

@@ -1,57 +1,58 @@
-# Filename: app/main.py
-# Approx lines modified: ~1-60 (imports), ~150-260 (webhook media branch), ~300-360 (DB query for product)
-# Reason:
-#  - Handle incoming images: download from Twilio, re-host under /public, classify with OpenAI Vision
-#  - If anchor ∈ HARDWARE_ANCHORS → fetch Product from Postgres and reply with product photo
-#  - Example path for martillo test included
-#  - [ADDED] Implement /conversations and /api/conversations routes using chat DB for UI/API
+from contextlib import asynccontextmanager
+from typing import Optional
 
-import time
-import re
-from typing import Optional, List
-
-from fastapi import FastAPI, Form, Depends, Request, Query
+from decouple import config
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from decouple import config
-from sqlalchemy import or_, func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.catalog import HARDWARE_ANCHORS
+from app.database import (
+    CatalogBase,
+    CatalogSessionLocal,
+    ChatBase,
+    ChatSessionLocal,
+    catalog_engine,
+    chat_engine,
+)
+from app.llm_logic import llm_classify_image, llm_sales_reply
 from app.models import Conversation, Product
-from app.utils import send_message, logger
-from app.utils import download_twilio_media_to_public
+from app.security import LimitBodySizeMiddleware, validate_twilio_signature, verify_admin
 from app.services.pdf import generate_pdf
-from app.llm_logic import llm_sales_reply, llm_classify_image
-from app.database import (ChatSessionLocal, CatalogSessionLocal, ChatBase, CatalogBase, chat_engine, catalog_engine)
+from app.utils import download_twilio_media_to_public, logger, send_message
 
-app = FastAPI()
+PUBLIC_BASE_URL = config("PUBLIC_BASE_URL", default="")
+MAX_REQUEST_BODY_BYTES = config("MAX_REQUEST_BODY_BYTES", cast=int, default=1_048_576)
 
-# Serve static + public (for media)
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-app.mount("/public", StaticFiles(directory="public"), name="public")
-templates = Jinja2Templates(directory="app/templates")
-
-PUBLIC_BASE_URL = config("PUBLIC_BASE_URL", default="")  # e.g., https://xxxx.ngrok-free.app
-
-# Guardrails/menu text
 HARDWARE_MENU = (
     "¿Qué necesitas? Ejemplos: martillos, taladros, brocas, lijas, tornillos, pintura, mangueras, "
     "tubería PVC, guantes, cascos, silicón."
 )
-REPLY_OFF_TOPIC = "Puedo ayudarte con productos de ferretería (precios, stock, cotizaciones). " + HARDWARE_MENU
 REPLY_DONT_KNOW = "Puedo ayudarte con productos de ferretería. " + HARDWARE_MENU
-
-# Keep this in sync with llm prompt anchors
-_HARDWARE_ANCHORS = [
-    "martillo", "taladro", "broca", "lija", "tornillo", "pintura", "manguera", "tubería", "tuberia",
-    "pvc", "guantes", "casco", "silicón", "silicon", "cinta", "escuadra", "tuerca", "perno",
-    "alicate", "destornillador", "sierra", "pegamento", "adhesivo", "cemento", "yeso", "lamina",
-    "cable", "multímetro", "multimetro", "escalera", "llave inglesa",
-]
-
 TRIM_LEN = 3000
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        ChatBase.metadata.create_all(bind=chat_engine)
+        CatalogBase.metadata.create_all(bind=catalog_engine)
+        logger.info("Database tables ensured on startup for both DBs.")
+    except Exception as exc:
+        logger.error("DB init failed at startup: %s", exc)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(LimitBodySizeMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+app.mount("/public", StaticFiles(directory="public"), name="public")
+templates = Jinja2Templates(directory="app/templates")
+
 
 def get_chat_db():
     db = ChatSessionLocal()
@@ -60,6 +61,7 @@ def get_chat_db():
     finally:
         db.close()
 
+
 def get_catalog_db():
     db = CatalogSessionLocal()
     try:
@@ -67,22 +69,17 @@ def get_catalog_db():
     finally:
         db.close()
 
-@app.on_event("startup")
-def on_startup():
-    try:
-        # Create tables for chat DB (conversations)
-        ChatBase.metadata.create_all(bind=chat_engine)
-        # Create tables for catalog DB (products)
-        CatalogBase.metadata.create_all(bind=catalog_engine)
-        logger.info("Database tables ensured on startup for both DBs.")
-    except Exception as e:
-        logger.error(f"DB init failed at startup: {e}")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.get("/")
 def root():
     return RedirectResponse(url="/conversations")
 
-# -------------------- Conversations UI -------------------- #
+
 @app.get("/conversations")
 async def list_conversations(
     request: Request,
@@ -90,11 +87,8 @@ async def list_conversations(
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=200),
     db: Session = Depends(get_chat_db),
+    _: str = Depends(verify_admin),
 ):
-    """
-    Browse/search conversations with pagination (renders HTML template).
-    Uses chat DB for Conversation queries.
-    """
     query = db.query(Conversation)
     if q:
         q_lower = f"%{q.lower()}%"
@@ -106,7 +100,12 @@ async def list_conversations(
             )
         )
     total = query.count()
-    items = query.order_by(Conversation.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    items = (
+        query.order_by(Conversation.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
     total_pages = (total + per_page - 1) // per_page if per_page > 0 else 1
     return templates.TemplateResponse(
         "conversations.html",
@@ -121,18 +120,15 @@ async def list_conversations(
         },
     )
 
-# -------------------- Conversations API -------------------- #
+
 @app.get("/api/conversations")
 async def api_list_conversations(
     q: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=200),
     db: Session = Depends(get_chat_db),
+    _: str = Depends(verify_admin),
 ):
-    """
-    JSON API for listing conversations with search/pagination.
-    Uses chat DB for Conversation queries.
-    """
     query = db.query(Conversation)
     if q:
         q_lower = f"%{q.lower()}%"
@@ -144,11 +140,17 @@ async def api_list_conversations(
             )
         )
     total = query.count()
-    items = query.order_by(Conversation.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    items = (
+        query.order_by(Conversation.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
     total_pages = (total + per_page - 1) // per_page if per_page > 0 else 1
     return {
         "items": [
-            {"id": c.id, "sender": c.sender, "message": c.message, "response": c.response} for c in items
+            {"id": item.id, "sender": item.sender, "message": item.message, "response": item.response}
+            for item in items
         ],
         "total": total,
         "page": page,
@@ -157,130 +159,132 @@ async def api_list_conversations(
         "q": q or "",
     }
 
-# -------------------- WhatsApp webhook -------------------- #
+
 @app.post("/message")
 async def reply(
-    Body: str = Form(...),
-    From_: str = Form(..., alias="From"),
-    To: str = Form(..., alias="To"),
-    NumMedia: str = Form("0"),
-    MediaUrl0: Optional[str] = Form(None),
-    MediaContentType0: Optional[str] = Form(None),
+    request: Request,
     db_chat: Session = Depends(get_chat_db),
     db_catalog: Session = Depends(get_catalog_db),
 ):
-    """
-    New behavior for images:
-      - If the user sends an image, we download it from Twilio, re-host under /public,
-        pass that PUBLIC URL to OpenAI Vision, and expect JSON with {anchor, description, confidence}.
-      - If anchor ∈ HARDWARE_ANCHORS, we look up Product in Postgres and reply with price/stock
-        and attach the product.photo (image_url) from DB.
-    """
+    form = await request.form()
+    await validate_twilio_signature(request, form)
 
-    text = Body.strip()
-    if len(text) > TRIM_LEN:
-        text = text[-TRIM_LEN:]
-    lower = text.lower()
-    n_media = _safe_int(NumMedia)
+    body = str(form.get("Body", "")).strip()
+    sender = str(form.get("From", ""))
+    num_media = _safe_int(str(form.get("NumMedia", "0")))
+    media_url = form.get("MediaUrl0")
+    media_content_type = form.get("MediaContentType0")
 
-    # (1) IMAGE HANDLING BRANCH
-    if n_media > 0 and MediaContentType0 and MediaContentType0.startswith("image/"):
+    if len(body) > TRIM_LEN:
+        body = body[-TRIM_LEN:]
+    lower = body.lower()
+
+    if num_media > 0 and media_content_type and str(media_content_type).startswith("image/"):
         try:
-            local_path, filename, public_url = download_twilio_media_to_public(MediaUrl0, out_dir="public")
-        except Exception as e:
-            logger.error(f"Failed downloading media: {e}")
+            local_path, _, public_url = download_twilio_media_to_public(
+                str(media_url), out_dir="public"
+            )
+        except Exception as exc:
+            logger.error("Failed downloading media: %s", exc)
             msg = "Recibí tu imagen, pero tuve un problema al procesarla. ¿Puedes describir el producto?"
-            _send_and_store(db_chat, From_, Body, msg)
+            _send_and_store(db_chat, sender, body, msg)
             return JSONResponse({"ok": True})
 
-        # [CHANGED START] Prefer LOCAL PATH → data URL (no external fetch)             #comments (~200)
         image_ref_for_llm = local_path if local_path else (public_url or "")
-        # [CHANGED END]
-
-        # Classify (GPT‑5‑nano Responses, minimal reasoning, low verbosity)
-        result = llm_classify_image(image_ref_for_llm, max_retries=3, force_detail="low")  #comments
+        result = llm_classify_image(image_ref_for_llm, max_retries=3, force_detail="low")
         anchor = (result.get("anchor") or "").strip().lower()
         description = result.get("description") or ""
-        confidence = float(result.get("confidence") or 0.0)
 
-        # 1.c If we recognize an anchor we sell → fetch from DB and reply attaching product image
-        if anchor in _HARDWARE_ANCHORS:
-            product = db_catalog.query(Product).filter(Product.anchor == anchor).first()  # [CHANGED] Use db_catalog
+        if anchor in HARDWARE_ANCHORS:
+            product = db_catalog.query(Product).filter(Product.anchor == anchor).first()
             if product:
                 price_usd = product.price_cents / 100.0
-                # #comments: Build a short, sales-friendly reply
                 reply_text = (
                     f"Puedo venderte: {description} ({anchor}). "
                     f"Tenemos {product.name}: ${price_usd:.2f}, stock {product.stock}."
                 )
                 media_list = [product.image_url] if product.image_url else None
-                _send_and_store(db_chat, From_, Body, reply_text, media_urls=media_list)  # [CHANGED] Pass db_chat
+                _send_and_store(db_chat, sender, body, reply_text, media_urls=media_list)
                 return JSONResponse({"ok": True})
-            else:
-                # #comments: Anchor recognized but not in DB
-                reply_text = (
-                    f"Identifiqué {description} ({anchor}). "
-                    "Aún no lo tengo cargado en inventario. ¿Deseas una cotización?"
-                )
-                _send_and_store(db_chat, From_, Body, reply_text)  # [CHANGED] Pass db_chat
-                return JSONResponse({"ok": True})
-        else:
-            # #comments: Not a hardware item from our catalog
+
             reply_text = (
-                "Gracias por la imagen. No identifiqué un producto de ferretería de nuestro catálogo. "
-                + HARDWARE_MENU
+                f"Identifiqué {description} ({anchor}). "
+                "Aún no lo tengo cargado en inventario. ¿Deseas una cotización?"
             )
-            _send_and_store(db_chat, From_, Body, reply_text)  # [CHANGED] Pass db_chat
+            _send_and_store(db_chat, sender, body, reply_text)
             return JSONResponse({"ok": True})
 
-    # (2) SIMPLE KEYWORDS WITHOUT LLM (example)
-    if "precio" in lower and "martillo" in lower:
-        # #comments: demo fallback when no image present
-        p = db_catalog.query(Product).filter(Product.anchor == "martillo").first()  # [CHANGED] Use db_catalog
-        if p:
-            price_usd = p.price_cents / 100.0
-            msg = f"El {p.name} cuesta ${price_usd:.2f} y hay {p.stock} en stock."
-            media_list = [p.image_url] if p.image_url else None
-            _send_and_store(db_chat, From_, Body, msg, media_urls=media_list)  # [CHANGED] Pass db_chat
-        else:
-            _send_and_store(db_chat, From_, Body, "Martillo disponible. ¿Deseas una cotización?")  # [CHANGED] Pass db_chat
+        reply_text = (
+            "Gracias por la imagen. No identifiqué un producto de ferretería de nuestro catálogo. "
+            + HARDWARE_MENU
+        )
+        _send_and_store(db_chat, sender, body, reply_text)
         return JSONResponse({"ok": True})
 
-    # (3) COTIZACIÓN FLOW (unchanged demo)
-    if any(k in lower for k in ("cotización", "cotizacion", "presupuesto")):
+    if "precio" in lower and "martillo" in lower:
+        product = db_catalog.query(Product).filter(Product.anchor == "martillo").first()
+        if product:
+            price_usd = product.price_cents / 100.0
+            msg = f"El {product.name} cuesta ${price_usd:.2f} y hay {product.stock} en stock."
+            media_list = [product.image_url] if product.image_url else None
+            _send_and_store(db_chat, sender, body, msg, media_urls=media_list)
+        else:
+            _send_and_store(
+                db_chat, sender, body, "Martillo disponible. ¿Deseas una cotización?"
+            )
+        return JSONResponse({"ok": True})
+
+    if any(keyword in lower for keyword in ("cotización", "cotizacion", "presupuesto")):
         content = "Detalle de Cotización:\nMartillo demo $3.00, 4 unidades."
         _, pdf_name = generate_pdf(content, out_dir="public")
         media_url = f"{PUBLIC_BASE_URL}/public/{pdf_name}" if PUBLIC_BASE_URL else None
-        msg = "Te envío la cotización en PDF adjunta." if media_url else "Generé la cotización (revisa /public)."
-        _send_and_store(db_chat, From_, Body, msg, media_urls=[media_url] if media_url else None)  # [CHANGED] Pass db_chat
+        msg = (
+            "Te envío la cotización en PDF adjunta."
+            if media_url
+            else "Generé la cotización (revisa /public)."
+        )
+        _send_and_store(
+            db_chat,
+            sender,
+            body,
+            msg,
+            media_urls=[media_url] if media_url else None,
+        )
         return JSONResponse({"ok": True})
 
-    # (4) OTHERWISE → one LLM text turn
-    chat_response = llm_sales_reply(text) or REPLY_DONT_KNOW
-    _send_and_store(db_chat, From_, Body, chat_response)  # [CHANGED] Pass db_chat
+    chat_response = llm_sales_reply(body) or REPLY_DONT_KNOW
+    _send_and_store(db_chat, sender, body, chat_response)
     return JSONResponse({"ok": True})
 
-# ----------------- Helpers ----------------- #
-def _send_and_store(db: Session, to_number: str, user_msg: str, reply_text: str, *, media_urls=None) -> None:  # [CHANGED] db is now passed (always db_chat)
+
+def _send_and_store(
+    db: Session,
+    to_number: str,
+    user_msg: str,
+    reply_text: str,
+    *,
+    media_urls=None,
+) -> None:
     try:
         send_message(to_number, reply_text, media_urls=media_urls)
-    except Exception as e:
-        logger.error(f"Failed to send WA message: {e}")
+    except Exception as exc:
+        logger.error("Failed to send WA message: %s", exc)
     _store(db, to_number, user_msg, reply_text)
 
-def _store(db: Session, sender: str, message: str, response: str):  # [CHANGED] db is passed
+
+def _store(db: Session, sender: str, message: str, response: str) -> None:
     try:
         conversation = Conversation(sender=sender, message=message, response=response)
         db.add(conversation)
         db.commit()
         logger.info("Conversation stored in database.")
-    except SQLAlchemyError as e:
+    except SQLAlchemyError as exc:
         db.rollback()
-        logger.error(f"DB store error: {e}")
+        logger.error("DB store error: %s", exc)
 
-def _safe_int(s: str, default: int = 0) -> int:
+
+def _safe_int(value: str, default: int = 0) -> int:
     try:
-        return int(s)
+        return int(value)
     except Exception:
         return default
-    
